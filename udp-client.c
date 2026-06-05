@@ -1,40 +1,50 @@
 #include "contiki.h"
 #include "net/routing/routing.h"
-#include "random.h"
 #include "net/netstack.h"
 #include "net/ipv6/simple-udp.h"
-#include "ota-metadata.h"
 #include <stdint.h>
-#include <inttypes.h>
+#include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "sys/node-id.h"
+#include "lib/crc16.h"
+
+#include "firmware_data.h"
+
 #include "sys/log.h"
-#define LOG_MODULE "App"
+#define LOG_MODULE "UDP-Client-OTA"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
-#define WITH_SERVER_REPLY  1
-#define UDP_CLIENT_PORT	8765
-#define UDP_SERVER_PORT	5678
+#define UDP_CLIENT_PORT 8765
+#define UDP_SERVER_PORT 5678
 
-#define SEND_INTERVAL		  (10 * CLOCK_SECOND)
+#define SEND_INTERVAL        (CLOCK_SECOND * 2)
+#define TIMEOUT_INTERVAL     (CLOCK_SECOND * 3)
+
+#define PKT_TYPE_DATA 1
+#define PKT_TYPE_ACK  2
+#define PKT_TYPE_NACK 3
+
+#define MAX_PAYLOAD_LEN 64
+
+typedef struct __attribute__((packed)) {
+  uint8_t type;
+  uint16_t seq_no;
+  uint16_t total_blocks;
+  uint8_t payload_len;
+  uint16_t crc16;
+  uint8_t payload[MAX_PAYLOAD_LEN];
+} ota_packet_t;
 
 static struct simple_udp_connection udp_conn;
-static uint32_t rx_count = 0;
-static ota_boot_metadata_t boot_metadata = {
-  .magic = OTA_IMAGE_MAGIC,
-  .active_slot = OTA_SLOT_A,
-  .candidate_slot = OTA_SLOT_NONE,
-  .state_a = OTA_IMAGE_STATE_CONFIRMED,
-  .state_b = OTA_IMAGE_STATE_EMPTY,
-};
+static struct etimer send_timer;
 
-/*---------------------------------------------------------------------------*/
-PROCESS(udp_client_process, "UDP client");
-AUTOSTART_PROCESSES(&udp_client_process);
-/*---------------------------------------------------------------------------*/
-static void
-udp_rx_callback(struct simple_udp_connection *c,
+static uint16_t current_seq_no = 0;
+static uint16_t total_blocks = 0;
+static bool transfer_complete = false;
+
+static void udp_rx_callback(struct simple_udp_connection *c,
          const uip_ipaddr_t *sender_addr,
          uint16_t sender_port,
          const uip_ipaddr_t *receiver_addr,
@@ -42,83 +52,92 @@ udp_rx_callback(struct simple_udp_connection *c,
          const uint8_t *data,
          uint16_t datalen)
 {
-  static uint32_t fake_version = 2;
-  uint32_t fake_image_crc;
+  if(datalen == sizeof(ota_packet_t)) {
+    ota_packet_t *pkt = (ota_packet_t *)data;
 
-  (void)c;
-  (void)sender_port;
-  (void)receiver_addr;
-  (void)receiver_port;
+    if(pkt->seq_no == current_seq_no) {
+      if(pkt->type == PKT_TYPE_ACK) {
+        LOG_INFO("ACK alindi: Blok %u. Sonraki bloga geciliyor.\n", pkt->seq_no);
 
-  LOG_INFO("Client received response '%.*s' from ", datalen, (char *) data);
-  LOG_INFO_6ADDR(sender_addr);
-#if LLSEC802154_CONF_ENABLED
-  LOG_INFO_(" LLSEC LV:%d", uipbuf_get_attr(UIPBUF_ATTR_LLSEC_LEVEL));
-#endif
-  LOG_INFO_("\n");
-  rx_count++;
+        current_seq_no++;
 
-  /*
-   * Placeholder integration for the first OTA path.
-   * In the real receiver, this information must come from the fully assembled
-   * Slot B image stored in flash.
-   */
-  fake_image_crc = ota_crc32_buffer(data, datalen);
-  if(ota_metadata_mark_verified(&boot_metadata, OTA_SLOT_B,
-                                fake_version, datalen, fake_image_crc) &&
-     ota_metadata_stage_verified_image(&boot_metadata, OTA_SLOT_B)) {
-    LOG_INFO("OTA metadata updated: slot B staged for activation\n");
+        if(current_seq_no >= total_blocks) {
+          transfer_complete = true;
+          LOG_INFO("Tum firmware bloklari basariyla gonderildi.\n");
+        } else {
+          etimer_set(&send_timer, CLOCK_SECOND / 50);
+        }
+      } else if(pkt->type == PKT_TYPE_NACK) {
+        LOG_INFO("NACK alindi: Blok %u. Tekrar gonderilecek.\n", pkt->seq_no);
+        etimer_set(&send_timer, CLOCK_SECOND / 50);
+      }
+    }
   }
 }
-/*---------------------------------------------------------------------------*/
+
+PROCESS(udp_client_process, "UDP client process");
+AUTOSTART_PROCESSES(&udp_client_process);
+
 PROCESS_THREAD(udp_client_process, ev, data)
 {
-  static struct etimer periodic_timer;
-  static char str[32];
-  uip_ipaddr_t dest_ipaddr;
-  static uint32_t tx_count;
-  static uint32_t missed_tx_count;
+  static uip_ipaddr_t dest_ipaddr;
+  static ota_packet_t pkt;
+  static uint32_t firmware_len;
 
   PROCESS_BEGIN();
 
-  /* Initialize UDP connection */
+  if(node_id != 2) {
+    LOG_INFO("Bu dugum router'dir (ID: %u). OTA baslatilmadi.\n", node_id);
+    while(1) {
+      PROCESS_WAIT_EVENT();
+    }
+  }
+
+  firmware_len = sizeof(firmware_payload);
+  total_blocks = (firmware_len + MAX_PAYLOAD_LEN - 1) / MAX_PAYLOAD_LEN;
+  LOG_INFO("Firmware: %lu byte, %u blok\n", (unsigned long)firmware_len, total_blocks);
+
   simple_udp_register(&udp_conn, UDP_CLIENT_PORT, NULL,
                       UDP_SERVER_PORT, udp_rx_callback);
 
-  etimer_set(&periodic_timer, random_rand() % SEND_INTERVAL);
+  etimer_set(&send_timer, SEND_INTERVAL);
+
   while(1) {
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&periodic_timer));
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&send_timer));
 
-    if(NETSTACK_ROUTING.node_is_reachable() &&
-        NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
-
-// Bu blok 3 numarali cihazda calismaz. 2-den-1-e gonderim icin yapildi. 3 numarali
-// cihaz komsuluk gorevi yapar. İletime yardim eder.
-
-      if(node_id == 2) {
-
-        LOG_INFO("Sending request %" PRIu32 " to ", tx_count);
-        LOG_INFO_6ADDR(&dest_ipaddr);
-        LOG_INFO_("\n");
-
-        snprintf(str, sizeof(str), "Merhaba %" PRIu32, tx_count);
-        simple_udp_sendto(&udp_conn, str, strlen(str), &dest_ipaddr);
-        tx_count++;
-      }
-
-
-    } else {
-      LOG_INFO("Not reachable yet\n");
-      if(tx_count > 0) {
-        missed_tx_count++;
-      }
+    if(transfer_complete) {
+      etimer_set(&send_timer, SEND_INTERVAL * 10);
+      continue;
     }
 
-    /* Add some jitter */
-    etimer_set(&periodic_timer, SEND_INTERVAL
-      - CLOCK_SECOND + (random_rand() % (2 * CLOCK_SECOND)));
+    if(NETSTACK_ROUTING.node_is_reachable() &&
+       NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
+
+      pkt.type         = PKT_TYPE_DATA;
+      pkt.seq_no       = current_seq_no;
+      pkt.total_blocks = total_blocks;
+
+      uint32_t offset    = (uint32_t)current_seq_no * MAX_PAYLOAD_LEN;
+      uint32_t remaining = firmware_len - offset;
+      pkt.payload_len    = (remaining > MAX_PAYLOAD_LEN) ? MAX_PAYLOAD_LEN : remaining;
+
+      memset(pkt.payload, 0, MAX_PAYLOAD_LEN);
+      memcpy(pkt.payload, &firmware_payload[offset], pkt.payload_len);
+
+      pkt.crc16 = crc16_data(pkt.payload, pkt.payload_len, 0);
+
+      LOG_INFO("Gonderiliyor: Blok %u/%u (%u byte)\n",
+               current_seq_no + 1, total_blocks, pkt.payload_len);
+
+      simple_udp_sendto(&udp_conn, &pkt, sizeof(pkt), &dest_ipaddr);
+
+      etimer_set(&send_timer, TIMEOUT_INTERVAL);
+
+    } else {
+      LOG_INFO("Node 1 henuz ulasilabilir degil. Bekleniyor...\n");
+      etimer_set(&send_timer, SEND_INTERVAL);
+    }
   }
 
   PROCESS_END();
 }
-/*---------------------------------------------------------------------------*/
