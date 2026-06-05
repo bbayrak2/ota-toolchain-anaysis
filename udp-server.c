@@ -86,7 +86,7 @@ static void udp_rx_callback(struct simple_udp_connection *c,
                 LOG_INFO("Yüklenmeye hazır yeni firmware alımı tamamlandı.\n");
             }
         } else {
-            LOG_ERR("CFS Error! Flash write failed.\n");
+            LOG_ERR("CFS Hatası! Flash belleğe yazma başarısız.\n");
             return; 
         }
     }
@@ -108,7 +108,7 @@ PROCESS_THREAD(udp_server_process, ev, data)
 
   simple_udp_register(&udp_conn, UDP_SERVER_PORT, NULL,
                       UDP_CLIENT_PORT, udp_rx_callback);
-  LOG_INFO("UDP server started, waiting for OTA firmware...\n");
+  LOG_INFO("UDP sunucusu başlatıldı, OTA yazılımı bekleniyor...\n");
   PROCESS_END();
 }
 /*---------------------------------------------------------------------------*/
